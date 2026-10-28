@@ -2953,21 +2953,6 @@ export const make = Effect.gen(function* () {
         });
       }
 
-      const thread =
-        input.threadId === undefined
-          ? undefined
-          : yield* threads.getThreadShell(input.threadId).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new GitCommandError({
-                    operation: "preparePullRequestThread",
-                    command: "git gtr",
-                    cwd: input.cwd,
-                    detail: "Unable to read thread setup permissions.",
-                    cause,
-                  }),
-              ),
-            );
       const worktree = yield* gitCore.createWorktree(
         {
           cwd: input.cwd,
@@ -2975,7 +2960,26 @@ export const make = Effect.gen(function* () {
           path: null,
         },
         {
-          skipSetup: thread?.linkOrigin !== undefined && linkOriginIsFenced(thread.linkOrigin),
+          skipSetup:
+            input.threadId === undefined
+              ? false
+              : threads.getThreadShell(input.threadId).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new GitCommandError({
+                        operation: "preparePullRequestThread.getThreadShell",
+                        command: "read thread setup permissions",
+                        cwd: input.cwd,
+                        detail: "Unable to read thread setup permissions.",
+                        cause,
+                      }),
+                  ),
+                  Effect.map(
+                    (thread) =>
+                      thread === null ||
+                      (thread.linkOrigin !== undefined && linkOriginIsFenced(thread.linkOrigin)),
+                  ),
+                ),
           worktreesDirectory: yield* readWorktreesDirectory,
           submodules: yield* projectSettingsFor(input).pipe(
             Effect.map(({ settings }) => settings.worktreeSubmodules),

@@ -3098,6 +3098,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           commands.push(command.args);
           if (command.args[1] === "--version")
             return Effect.succeed(makeSuccessfulHandle("git gtr version 2.11.1\n"));
+          assert.equal(command.options.env?.LC_ALL, process.env.LC_ALL);
           return Effect.gen(function* () {
             yield* gitDriver
               .execute({
@@ -3142,7 +3143,11 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         );
         assert.deepEqual(created.worktree, { path: worktreePath, refName: "feature/gtr" });
         assert.isTrue(created.setupHandled);
-        assert.deepEqual(claimed, [worktreePath]);
+        assert.lengthOf(claimed, 1);
+        assert.equal(
+          NodeFS.realpathSync.native(claimed[0]!),
+          NodeFS.realpathSync.native(worktreePath),
+        );
         assert.deepEqual(commands, [
           ["gtr", "--version"],
           [
@@ -3259,57 +3264,128 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         }),
     );
 
-    it.effect("uses gtr local tracking and honors skipped setup", () =>
+    it.effect.each([false, true])(
+      "uses gtr local tracking with deferred skip setup: %s",
+      (skipSetup) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          yield* git(cwd, ["branch", "feature/existing"]);
+          yield* git(cwd, ["config", "t3.worktreeManager", "gtr"]);
+          const path = yield* Path.Path;
+          const worktreePath = path.join(yield* makeTmpDir(), "existing");
+          const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const commands: ReadonlyArray<string>[] = [];
+          const spawner = ChildProcessSpawner.make((command) => {
+            if (!ChildProcess.isStandardCommand(command) || command.args[0] !== "gtr")
+              return delegate.spawn(command);
+            commands.push(command.args);
+            if (command.args[1] === "--version")
+              return Effect.succeed(makeSuccessfulHandle("git gtr version 2.11.1\n"));
+            return gitDriver
+              .execute({
+                operation: "test",
+                cwd,
+                args: ["worktree", "add", worktreePath, "feature/existing"],
+              })
+              .pipe(
+                Effect.orDie,
+                Effect.as(
+                  makeSuccessfulHandle(
+                    `path\t${worktreePath}\nbranch\tfeature/existing\nhook_status\tdisabled\n`,
+                  ),
+                ),
+              );
+          });
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provide(layerServerConfig),
+          );
+          const result = yield* driver.createWorktree(
+            { cwd, refName: "refs/heads/feature/existing", path: null },
+            { skipSetup: Effect.succeed(skipSetup) },
+          );
+          assert.isTrue(result.setupHandled);
+          assert.deepEqual(commands[1], [
+            "gtr",
+            "new",
+            "feature/existing",
+            "--track",
+            "local",
+            "--no-fetch",
+            "--porcelain",
+            ...(skipSetup ? ["--no-hooks"] : []),
+          ]);
+        }),
+    );
+
+    it.effect("claims a registered gtr worktree when cancelled during setup", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
-        yield* initRepoWithCommit(cwd);
-        yield* git(cwd, ["branch", "feature/existing"]);
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
         yield* git(cwd, ["config", "t3.worktreeManager", "gtr"]);
         const path = yield* Path.Path;
-        const worktreePath = path.join(yield* makeTmpDir(), "existing");
+        const worktreePath = path.join(yield* makeTmpDir(), "cancelled");
+        const started = yield* Deferred.make<void>();
         const gitDriver = yield* GitVcsDriver.GitVcsDriver;
         const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
-        const commands: ReadonlyArray<string>[] = [];
         const spawner = ChildProcessSpawner.make((command) => {
           if (!ChildProcess.isStandardCommand(command) || command.args[0] !== "gtr")
             return delegate.spawn(command);
-          commands.push(command.args);
           if (command.args[1] === "--version")
             return Effect.succeed(makeSuccessfulHandle("git gtr version 2.11.1\n"));
           return gitDriver
             .execute({
               operation: "test",
               cwd,
-              args: ["worktree", "add", worktreePath, "feature/existing"],
+              args: ["worktree", "add", "-b", "feature/cancelled", worktreePath, initialBranch],
             })
             .pipe(
               Effect.orDie,
-              Effect.as(
-                makeSuccessfulHandle(
-                  `path\t${worktreePath}\nbranch\tfeature/existing\nhook_status\tdisabled\n`,
-                ),
-              ),
+              Effect.as({
+                ...makeSuccessfulHandle(""),
+                exitCode: Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)),
+              }),
             );
         });
         const driver = yield* makeGitVcsDriverCore().pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.provide(layerServerConfig),
         );
-        const result = yield* driver.createWorktree(
-          { cwd, refName: "refs/heads/feature/existing", path: null },
-          { skipSetup: true },
+        const claimed: string[] = [];
+        const fiber = yield* driver
+          .createWorktree(
+            { cwd, refName: initialBranch, newRefName: "feature/cancelled", path: null },
+            {
+              progress: {
+                onWorktreeClaimed: (value) => Effect.sync(() => void claimed.push(value)),
+              },
+            },
+          )
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(started);
+        yield* Fiber.interrupt(fiber);
+        assert.lengthOf(claimed, 1);
+        assert.equal(
+          NodeFS.realpathSync.native(claimed[0]!),
+          NodeFS.realpathSync.native(worktreePath),
         );
-        assert.isTrue(result.setupHandled);
-        assert.deepEqual(commands[1], [
-          "gtr",
-          "new",
-          "feature/existing",
-          "--track",
-          "local",
-          "--no-fetch",
-          "--porcelain",
-          "--no-hooks",
-        ]);
+        yield* driver.removeWorktree({ cwd, path: claimed[0]!, force: true });
+        assert.isFalse(yield* (yield* FileSystem.FileSystem).exists(worktreePath));
+      }),
+    );
+
+    it.effect("does not read setup permissions for native creation", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const result = yield* driver.createWorktree(
+          { cwd, refName: initialBranch, newRefName: "feature/native", path: null },
+          { skipSetup: Effect.die("Native checkout must not read gtr setup permissions") },
+        );
+        assert.isUndefined(result.setupHandled);
       }),
     );
 
