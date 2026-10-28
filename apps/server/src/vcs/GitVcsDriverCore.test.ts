@@ -3080,6 +3080,267 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
   });
 
   describe("worktree operations", () => {
+    it.effect("lets opted-in gtr choose the path and finish setup before claiming a worktree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const path = yield* Path.Path;
+        const fs = yield* FileSystem.FileSystem;
+        const worktreePath = path.join(yield* makeTmpDir(), "gtr checkout");
+        yield* git(cwd, ["config", "t3.worktreeManager", "gtr"]);
+        const base = yield* git(cwd, ["rev-parse", "HEAD"]);
+        const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+        const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const commands: ReadonlyArray<string>[] = [];
+        const spawner = ChildProcessSpawner.make((command) => {
+          if (!ChildProcess.isStandardCommand(command) || command.args[0] !== "gtr")
+            return delegate.spawn(command);
+          commands.push(command.args);
+          if (command.args[1] === "--version")
+            return Effect.succeed(makeSuccessfulHandle("git gtr version 2.11.1\n"));
+          return Effect.gen(function* () {
+            yield* gitDriver
+              .execute({
+                operation: "test",
+                cwd,
+                args: ["worktree", "add", "-b", "feature/gtr", worktreePath, base],
+              })
+              .pipe(Effect.orDie);
+            yield* fs.writeFileString(
+              path.join(worktreePath, "setup-complete"),
+              "copied and prepared\n",
+            );
+            return makeSuccessfulHandle(
+              `path\t${worktreePath}\nbranch\tfeature/gtr\nhook_status\tran\n`,
+            );
+          });
+        });
+        const driver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provide(layerServerConfig),
+        );
+        const claimed: string[] = [];
+        const created = yield* driver.createWorktree(
+          {
+            cwd,
+            refName: initialBranch,
+            newRefName: "feature/gtr",
+            baseRefName: initialBranch,
+            path: null,
+          },
+          {
+            worktreesDirectory: "invalid-relative-path",
+            progress: {
+              onWorktreeClaimed: (claimedPath) =>
+                fs.exists(path.join(claimedPath, "setup-complete")).pipe(
+                  Effect.orDie,
+                  Effect.tap((exists) => Effect.sync(() => assert.isTrue(exists))),
+                  Effect.andThen(Effect.sync(() => void claimed.push(claimedPath))),
+                ),
+            },
+          },
+        );
+        assert.deepEqual(created.worktree, { path: worktreePath, refName: "feature/gtr" });
+        assert.isTrue(created.setupHandled);
+        assert.deepEqual(claimed, [worktreePath]);
+        assert.deepEqual(commands, [
+          ["gtr", "--version"],
+          [
+            "gtr",
+            "new",
+            "feature/gtr",
+            "--from",
+            base,
+            "--track",
+            "none",
+            "--no-fetch",
+            "--porcelain",
+          ],
+        ]);
+        assert.equal(
+          yield* git(cwd, ["config", "branch.feature/gtr.t3-merge-base"]),
+          initialBranch,
+        );
+      }),
+    );
+
+    it.effect.each(["failure", "malformed", "wrong-branch", "unregistered"] as const)(
+      "retains gtr worktrees after %s without claiming or falling back",
+      (mode) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const path = yield* Path.Path;
+          const worktreePath = path.join(yield* makeTmpDir(), "partial");
+          yield* git(cwd, ["config", "t3.worktreeManager", "gtr"]);
+          const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const spawner = ChildProcessSpawner.make((command) => {
+            if (!ChildProcess.isStandardCommand(command) || command.args[0] !== "gtr")
+              return delegate.spawn(command);
+            if (command.args[1] === "--version")
+              return Effect.succeed(makeSuccessfulHandle("git gtr version 2.11.1\n"));
+            return Effect.gen(function* () {
+              if (mode !== "unregistered")
+                yield* gitDriver
+                  .execute({
+                    operation: "test",
+                    cwd,
+                    args: ["worktree", "add", "-b", "feature/partial", worktreePath, initialBranch],
+                  })
+                  .pipe(Effect.orDie);
+              return mode === "failure"
+                ? makeFailedHandle("postCreate hook failed")
+                : makeSuccessfulHandle(
+                    mode === "malformed"
+                      ? "bad output"
+                      : `path\t${worktreePath}\nbranch\t${mode === "wrong-branch" ? "other" : "feature/partial"}\nhook_status\tran\n`,
+                  );
+            });
+          });
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provide(layerServerConfig),
+          );
+          let claimed = 0;
+          const result = yield* driver
+            .createWorktree(
+              { cwd, refName: initialBranch, newRefName: "feature/partial", path: null },
+              {
+                progress: {
+                  onWorktreeClaimed: () =>
+                    Effect.sync(() => {
+                      claimed++;
+                    }),
+                },
+              },
+            )
+            .pipe(Effect.result);
+          assert.isTrue(Result.isFailure(result));
+          assert.equal(claimed, 0);
+          if (mode !== "unregistered") {
+            assert.equal(yield* git(worktreePath, ["branch", "--show-current"]), "feature/partial");
+            if (Result.isFailure(result)) assert.include(result.failure.detail, "kept");
+          }
+        }),
+    );
+
+    it.effect.each(["2.9.0", "missing"])(
+      "rejects unavailable gtr %s without native fallback",
+      (version) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          yield* git(cwd, ["config", "t3.worktreeManager", "gtr"]);
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const spawner = ChildProcessSpawner.make((command) =>
+            !ChildProcess.isStandardCommand(command) || command.args[0] !== "gtr"
+              ? delegate.spawn(command)
+              : Effect.succeed(
+                  version === "missing"
+                    ? makeFailedHandle("git: gtr is not a git command")
+                    : makeSuccessfulHandle(`git gtr version ${version}\n`),
+                ),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provide(layerServerConfig),
+          );
+          const result = yield* driver
+            .createWorktree({
+              cwd,
+              refName: initialBranch,
+              newRefName: "feature/unavailable",
+              path: null,
+            })
+            .pipe(Effect.result);
+          assert.isTrue(Result.isFailure(result));
+          assert.equal(yield* git(cwd, ["branch", "--list", "feature/unavailable"]), "");
+        }),
+    );
+
+    it.effect("uses gtr local tracking and honors skipped setup", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["branch", "feature/existing"]);
+        yield* git(cwd, ["config", "t3.worktreeManager", "gtr"]);
+        const path = yield* Path.Path;
+        const worktreePath = path.join(yield* makeTmpDir(), "existing");
+        const gitDriver = yield* GitVcsDriver.GitVcsDriver;
+        const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const commands: ReadonlyArray<string>[] = [];
+        const spawner = ChildProcessSpawner.make((command) => {
+          if (!ChildProcess.isStandardCommand(command) || command.args[0] !== "gtr")
+            return delegate.spawn(command);
+          commands.push(command.args);
+          if (command.args[1] === "--version")
+            return Effect.succeed(makeSuccessfulHandle("git gtr version 2.11.1\n"));
+          return gitDriver
+            .execute({
+              operation: "test",
+              cwd,
+              args: ["worktree", "add", worktreePath, "feature/existing"],
+            })
+            .pipe(
+              Effect.orDie,
+              Effect.as(
+                makeSuccessfulHandle(
+                  `path\t${worktreePath}\nbranch\tfeature/existing\nhook_status\tdisabled\n`,
+                ),
+              ),
+            );
+        });
+        const driver = yield* makeGitVcsDriverCore().pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.provide(layerServerConfig),
+        );
+        const result = yield* driver.createWorktree(
+          { cwd, refName: "refs/heads/feature/existing", path: null },
+          { skipSetup: true },
+        );
+        assert.isTrue(result.setupHandled);
+        assert.deepEqual(commands[1], [
+          "gtr",
+          "new",
+          "feature/existing",
+          "--track",
+          "local",
+          "--no-fetch",
+          "--porcelain",
+          "--no-hooks",
+        ]);
+      }),
+    );
+
+    it.effect("keeps exact-path recreation native even with an invalid manager", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["config", "t3.worktreeManager", "unknown"]);
+        const path = yield* Path.Path;
+        const worktreePath = path.join(yield* makeTmpDir(), "recreated");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const result = yield* driver.createWorktree({
+          cwd,
+          refName: initialBranch,
+          newRefName: "feature/recreated",
+          path: worktreePath,
+        });
+        assert.isUndefined(result.setupHandled);
+        assert.equal(result.worktree.path, worktreePath);
+        const invalid = yield* driver
+          .createWorktree({
+            cwd,
+            refName: initialBranch,
+            newRefName: "feature/invalid",
+            path: null,
+          })
+          .pipe(Effect.result);
+        assert.isTrue(Result.isFailure(invalid));
+      }),
+    );
+
     it.effect("uses parallel checkout without skipping filters or hooks", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
